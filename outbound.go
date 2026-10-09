@@ -93,15 +93,17 @@ func (c *Conn) outboundHandle(handler OutboundHandler, connectionDelay, connectT
 }
 
 func (c *Conn) dummyLoop() {
+	disconnect := c.responseChannel(TypeDisconnect)
+	authRequest := c.responseChannel(TypeAuthRequest)
 	select {
-	case <-c.responseChannels[TypeDisconnect]:
+	case <-disconnect:
 		c.logger.Info("Disconnect outbound connection", c.conn.RemoteAddr())
 		if c.closeDelay >= 0 {
 			time.AfterFunc(c.closeDelay*time.Second, func() {
 				c.Close()
 			})
 		}
-	case <-c.responseChannels[TypeAuthRequest]:
+	case <-authRequest:
 		c.logger.Debug("Ignoring auth request on outbound connection", c.conn.RemoteAddr())
 	case <-c.runningContext.Done():
 		return

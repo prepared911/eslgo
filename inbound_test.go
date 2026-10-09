@@ -100,3 +100,95 @@ func listenTCP(t *testing.T) net.Listener {
 	require.NoError(t, err)
 	return listener
 }
+
+// TestInboundClose_NoRaceOnResponseChannels drops the socket after auth.
+// disconnectLoop then calls Close, which deletes responseChannels, while
+// authLoop is still selecting on that map.
+func TestInboundClose_NoRaceOnResponseChannels(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		dropAuthenticatedSocket(t)
+	}
+}
+
+func dropAuthenticatedSocket(t *testing.T) {
+	t.Helper()
+	listener := listenTCP(t)
+	defer listener.Close()
+
+	release := make(chan struct{})
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		if _, err := conn.Write([]byte("Content-Type: auth/request\r\n\r\n")); err != nil {
+			return
+		}
+		buf := make([]byte, 256)
+		if _, err := conn.Read(buf); err != nil {
+			return
+		}
+		if _, err := conn.Write([]byte("Content-Type: command/reply\r\nReply-Text: +OK accepted\r\n\r\n")); err != nil {
+			return
+		}
+		<-release
+		_, _ = conn.Write([]byte("Content-Type: text/disconnect-notice\r\n\r\n"))
+	}()
+
+	opts := DefaultInboundOptions
+	opts.Logger = NilLogger{}
+	opts.AuthTimeout = time.Second
+	disconnected := make(chan struct{})
+	opts.OnDisconnect = func() {
+		close(disconnected)
+	}
+
+	conn, err := opts.Dial(listener.Addr().String())
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+	defer conn.Close()
+	close(release)
+	assertOnDisconnect(t, disconnected)
+}
+
+// TestDisconnectLoop_AfterCloseDoesNotNotify checks that a disconnectLoop
+// started after Close returns without calling onDisconnect, as it did when it
+// read the deleted map entry as a nil channel.
+func TestDisconnectLoop_AfterCloseDoesNotNotify(t *testing.T) {
+	server, client := net.Pipe()
+	defer server.Close()
+	connection := newConnection(client, false, Options{Context: context.Background(), Logger: NilLogger{}})
+	connection.Close()
+
+	called := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		connection.disconnectLoop(func() { called <- struct{}{} })
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("disconnectLoop did not return after Close")
+	}
+	assert.Empty(t, called)
+}
+
+// TestOutboundDummyLoop_NoRaceOnClose closes an outbound connection while
+// dummyLoop is selecting on responseChannels.
+func TestOutboundDummyLoop_NoRaceOnClose(t *testing.T) {
+	for i := 0; i < 40; i++ {
+		server, client := net.Pipe()
+		connection := newConnection(client, true, Options{Context: context.Background(), Logger: NilLogger{}})
+		done := make(chan struct{})
+		go func() {
+			connection.dummyLoop()
+			close(done)
+		}()
+		connection.Close()
+		<-done
+		server.Close()
+	}
+}

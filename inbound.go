@@ -97,9 +97,22 @@ func (opts InboundOptions) Dial(address string) (*Conn, error) {
 	return connection, nil
 }
 
+// responseChannel reads one response channel under responseChanMutex.
+// Conn.close deletes from that map while holding the write lock, so an
+// unlocked read can abort the process with a concurrent map read and write.
+// Callers read before select: holding the read lock across the receive would
+// deadlock close, which needs the write lock to close the channel. After
+// close the entry is gone and this returns nil, as the unlocked read did.
+func (c *Conn) responseChannel(contentType string) <-chan *RawResponse {
+	c.responseChanMutex.RLock()
+	defer c.responseChanMutex.RUnlock()
+	return c.responseChannels[contentType]
+}
+
 func (c *Conn) disconnectLoop(onDisconnect func()) {
+	disconnect := c.responseChannel(TypeDisconnect)
 	select {
-	case <-c.responseChannels[TypeDisconnect]:
+	case <-disconnect:
 		c.Close()
 		if onDisconnect != nil {
 			onDisconnect()
@@ -111,9 +124,10 @@ func (c *Conn) disconnectLoop(onDisconnect func()) {
 }
 
 func (c *Conn) authLoop(auth command.Auth, authTimeout time.Duration) {
+	authRequest := c.responseChannel(TypeAuthRequest)
 	for {
 		select {
-		case <-c.responseChannels[TypeAuthRequest]:
+		case <-authRequest:
 			authCtx, cancel := context.WithTimeout(c.runningContext, authTimeout)
 			err := c.doAuth(authCtx, auth)
 			cancel()
